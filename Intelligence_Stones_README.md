@@ -1,3 +1,21 @@
+<p align="center">
+  <img src="https://capsule-render.vercel.app/api?type=waving&color=0:0A0A0A,100:1A1A2E&height=200&section=header&text=Intelligence%20Stones&fontSize=40&fontColor=FFFFFF&animation=fadeIn" />
+</p>
+
+<p align="center">
+  <b>Plug real intelligence into your AI</b>
+</p>
+
+<p align="center">
+  Modular cognitive layers for adaptive AI systems
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.9+-black?style=for-the-badge&logo=python">
+  <img src="https://img.shields.io/badge/Zero-Dependencies-black?style=for-the-badge">
+  <img src="https://img.shields.io/badge/AI-Modular-black?style=for-the-badge">
+</p>
+
 # Intelligence Stones
 
 > *Plug real intelligence into your AI — not just responses.*
