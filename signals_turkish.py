@@ -17,9 +17,12 @@ from mind_stone import SignalConfig
 
 # ── Normalisation ─────────────────────────────────────────────────────────────
 
+# The source string below contains Turkish characters intentionally —
+# they are the *keys* of the mapping table that strips diacritics.
+# Without them, _norm_tr() cannot convert Turkish input to ASCII for matching.
 _TR_MAP = str.maketrans(
-    "çğışöüÇĞİŞÖÜ",
-    "cgisouCGISOu",
+    "çğışöüÇĞİŞÖÜ",   # Turkish diacritics (source)
+    "cgisouCGISOu",    # ASCII equivalents  (target)
 )
 
 
