@@ -1,0 +1,305 @@
+# Intelligence Stones
+
+> *Plug real intelligence into your AI — not just responses.*
+
+A collection of lightweight, zero-dependency Python modules that upgrade how AI systems **communicate, understand, and adapt** to users.
+
+No framework. No setup.
+Each stone is a drop-in.
+Together, they create a self-improving AI system.
+
+---
+
+## ⚡ What is this?
+
+Most AI systems:
+
+* talk the same way to everyone
+* don’t know if they were understood
+* forget everything between sessions
+* react instead of anticipating
+
+**Intelligence Stones fixes this — one layer at a time.**
+
+---
+
+## 🧩 The Stones
+
+| Stone               | Status            | What it adds                             |
+| ------------------- | ----------------- | ---------------------------------------- |
+| **Mind Stone**      | `v1.2.0` ✅        | Learns *how* the user communicates       |
+| **Echo Stone**      | `v1.0.0` ✅        | Detects if the user actually understood  |
+| **Bond Stone**      | 🔒 in development | Remembers the user’s world               |
+| **Intuition Stone** | 🔒 in development | Predicts where the conversation is going |
+
+---
+
+## 🧠 The Core Idea
+
+Instead of building intelligence from scratch:
+
+👉 **You plug it in.**
+
+Each stone adds a specific cognitive ability.
+
+---
+
+## 🔁 The Core Loop
+
+```
+Mind Stone → controls how the AI speaks
+Echo Stone → checks if it worked
+```
+
+Together:
+
+→ a self-correcting communication system
+
+---
+
+## 🧠 How the system works
+
+```
+User input
+   │
+   ├─ Intuition Stone  (prediction — future)
+   ├─ Bond Stone       (context — memory)
+   ├─ Mind Stone       (style — delivery)
+   ▼
+Assistant response
+   ▼
+Echo Stone           (feedback — did it land?)
+```
+
+No ML models.
+No embeddings.
+No external APIs.
+
+Just fast, interpretable logic.
+
+---
+
+# 🧠 Mind Stone
+
+> Learns how the user prefers communication.
+
+* adjusts tone, depth, format
+* detects signals like “too long”, “show me”
+* builds a dynamic style profile
+
+### Quick usage
+
+```python
+from mind_stone import MindStone
+
+stone = MindStone()
+
+stone.observe(user_message, assistant_message)
+
+directive = stone.get_style_directive()
+if directive:
+    system_prompt += "\n\n" + directive
+```
+
+---
+
+# 📡 Echo Stone
+
+> Detects whether the user actually understood.
+
+* catches false confirmations
+* detects confusion & overload
+* forces explanation to improve
+
+### Quick usage
+
+```python
+from echo_stone import EchoStone
+
+stone = EchoStone()
+
+stone.observe(user_message, assistant_message)
+
+directive = stone.get_comprehension_directive()
+if directive:
+    system_prompt += "\n\n" + directive
+```
+
+---
+
+## 🔗 Using both together
+
+```python
+from mind_stone import MindStone
+from echo_stone import EchoStone
+
+mind = MindStone()
+echo = EchoStone()
+
+def after_turn(user, assistant):
+    mind.observe(user, assistant)
+    echo.observe(user, assistant)
+
+def build_prompt(base):
+    directives = []
+
+    if d := mind.get_style_directive():
+        directives.append(d)
+
+    if d := echo.get_comprehension_directive():
+        directives.append(d)
+
+    return base + ("\n\n".join(directives) if directives else "")
+```
+
+---
+
+## 🔮 What's coming
+
+### Bond Stone
+
+Persistent structured memory of the user's world
+(projects, tools, constraints)
+
+### Intuition Stone
+
+Learns conversation patterns
+and predicts what comes next
+
+---
+
+## 💥 Why this matters
+
+Without this:
+
+* AI repeats mistakes
+* explanations don’t improve
+* users adapt to AI
+
+With this:
+
+* AI adapts to users
+* explanations evolve
+* communication improves every turn
+
+## 🔥 Before vs After
+
+### ❌ Before — Standard AI
+
+```text
+User: explain CUDA memory issue
+
+AI:
+CUDA memory issues occur when GPU memory allocation exceeds capacity.
+You can fix this by reducing batch size, clearing cache, or using torch.cuda.empty_cache().
+```
+
+```text
+User: ok got it
+```
+
+```text
+User (2 min later):
+wait why does batch size affect memory?
+```
+
+👉 Problems:
+
+* Same explanation style for every user
+* Didn’t detect confusion
+* Moved on too early
+* No learning across turns
+
+---
+
+### ✅ After — With Intelligence Stones
+
+```text
+User: explain CUDA memory issue
+
+AI:
+You're hitting GPU memory limits.
+
+Quick fix:
+- reduce batch size
+- clear cache
+
+Example:
+batch_size = 16 → try 8
+
+Want a deeper breakdown?
+```
+
+```text
+User: ok got it
+```
+
+```text
+Echo Stone:
+⚠ false confirmation detected
+(user repeated topic pattern)
+```
+
+```text
+AI (next turn auto-adjusts):
+Earlier you said "got it", but this usually means it's still unclear.
+
+Here's the key idea:
+Batch size = how many samples sit in memory at once.
+
+More samples → more GPU memory.
+
+Think of it like RAM slots filling up.
+```
+
+👉 Improvements:
+
+* Adjusted explanation style (Mind Stone)
+* Detected misunderstanding (Echo Stone)
+* Self-corrected automatically
+* Learned from previous turn
+
+---
+
+## 🧠 The Difference
+
+Without Intelligence Stones:
+
+→ AI answers
+
+With Intelligence Stones:
+
+→ AI **adapts**
+
+---
+
+## ⚡ What actually changed?
+
+| Capability             | Standard AI | With Stones                |
+| ---------------------- | ----------- | -------------------------- |
+| Communication style    | Static      | Learns per user            |
+| Understanding feedback | None        | Detects real comprehension |
+| Error correction       | Manual      | Automatic                  |
+| Learning across turns  | Weak        | Continuous                 |
+| User adaptation        | ❌           | ✅                          |
+
+---
+
+## 💥 Bottom line
+
+> Most AI systems generate responses.
+> This system learns how to communicate.
+
+
+---
+
+## ⚙️ Requirements
+
+Python 3.9+
+No external dependencies
+
+---
+
+## 📄 License
+
+MIT
