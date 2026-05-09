@@ -1,78 +1,54 @@
-"""
-Mind Stone — Adaptive Intelligence Profile
-==========================================
-A lightweight, self-calibrating module that learns *how* a user communicates
-and adjusts an AI assistant's style accordingly — without any explicit setup.
+"""Mind Stone — Adaptive Communication Profile.  v1.3.0
 
-No external dependencies. Pure Python standard library.
-Works with any LLM backend (OpenAI, Anthropic, Gemini, Ollama, etc.).
+Learns *how* a user communicates, not *what* they say.
+Builds a quantified style profile from signal detection and EMA updates.
+Generates a short directive injected into the system prompt — shaping
+tone, depth, and format without the user ever configuring anything.
 
-Core idea
----------
-Most AI assistants know *what* to say but not *how* to say it for this
-specific person. Mind Stone silently observes each conversation turn and
-builds a quantified profile of the user's communication preferences:
+Profile dimensions:
+  verbosity         — preferred response length (0=terse, 1=detailed)
+  verbosity_tech    — verbosity for technical topics (v1.3)
+  verbosity_general — verbosity for general topics (v1.3)
+  tech_depth        — technical vocabulary density (0=plain, 1=expert)
+  example_bias      — examples-first vs theory-first (0=theory, 1=example)
+  follow_up_rate    — satisfaction with first reply (0=always satisfied)
+  peak_hours        — most active hours
+  total_turns       — observations recorded (used for confidence scoring)
 
-  * Do they prefer short, punchy answers or detailed explanations?
-  * Are they a technical expert or do they need plain language?
-  * Do they learn better from examples or from theory first?
-  * Are they quickly satisfied or do they always ask follow-ups?
+v1.3 changes:
+  - Topic-conditional verbosity: technical and general content tracked separately
+  - Explicit override: "keep it short" / "more detail" set the value directly
+    instead of nudging it via EMA
 
-After enough observations, Mind Stone generates a short style directive
-that is injected into the system prompt -- shaping how the assistant talks,
-not what it knows.
+How it works:
+  - Call observe(user_msg, assistant_msg) after every conversation turn
+  - EMA (alpha=0.12) updates the profile slowly — resistant to one-off turns
+  - Directives activate after ~12 turns of observation
+  - Returned directive is 1-3 sentences, for silent injection into system prompt
 
-Usage (5 lines)
----------------
+Persistence:
+  .mind_stone.json — profile survives application restarts
+
+Language:
+  Ships with English signal sets. For other languages, override the module-level
+  frozensets or pass a normalise_fn to the constructor. See signals_turkish.py
+  for a complete Turkish reference.
+
+Quick start:
     from mind_stone import MindStone
 
-    stone = MindStone()                              # loads saved profile
+    stone = MindStone()
 
-    # After each conversation turn:
+    # After every conversation turn:
     stone.observe(user_message, assistant_message)
 
-    # Before each LLM call:
-    directive = stone.get_style_directive()          # "" until enough data
+    # Before every LLM call:
+    directive = stone.get_style_directive()   # "" until ~12 turns
     if directive:
         system_prompt += "\\n\\n" + directive
-
-Profile is auto-saved to `.mind_stone.json` every 5 turns.
-
-Customisation
--------------
-Mind Stone ships with English signal sets. To use another language, pass
-a custom SignalConfig:
-
-    from mind_stone import MindStone, SignalConfig
-    from signals_turkish import TR_CONFIG   # example file in this repo
-
-    stone = MindStone(config=TR_CONFIG)
-
-v1.1 additions
---------------
-  * Session boundary detection (gap > session_gap_minutes = new session)
-  * Session-dampened EMA: first 3 turns of a new session use alpha * 0.5
-    so a single atypical session cannot override a long-term profile
-  * observe(verbose=True) returns a signal report dict for debugging
-  * session_summary() method for current-session statistics
-  * Temporal directive: flags when user is active outside their typical hours
-  * Backward-compatible with v1.0 profile files
-
-v1.2 additions
---------------
-  * Thread-safe: all public methods protected by threading.Lock
-  * Correct type hint: normalise_fn is Optional[Callable[[str], str]]
-  * tech_amplifier parameter replaces the hardcoded *8 multiplier
-  * Satisfied-token threshold raised from 4 to 6 words
-  * follow_up_rate now factors in question markers (?, "why", "how", ...)
-    so "got it, but why?" is not counted as satisfied
-
-License: MIT
 """
 
 from __future__ import annotations
-
-__version__ = "1.2.0"
 
 import json
 import re
@@ -84,547 +60,387 @@ from pathlib import Path
 from typing import Callable, Optional
 
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+# ── Persistence ────────────────────────────────────────────────────────────────
 
-@dataclass
-class SignalConfig:
-    """Language-specific signal sets.
-
-    All values are plain ASCII strings -- normalise diacritics before
-    passing text to observe() if your language uses them (see _norm helper).
-
-    Attributes
-    ----------
-    neg_verbosity    Phrases that mean "give me shorter answers"
-    pos_verbosity    Phrases that mean "give me more detail"
-    example_signals  Phrases that mean "show me an example / code"
-    theory_signals   Phrases that mean "explain the why / theory"
-    satisfied_tokens Short tokens that indicate the user is satisfied
-    tech_words       Vocabulary that indicates technical expertise
-    normalise_fn     Optional callable: (str) -> str.
-                     Normalises text before signal matching (e.g. strip diacritics).
-                     Receives a lowercase string, must return a string.
-    """
-    neg_verbosity:    frozenset = field(default_factory=frozenset)
-    pos_verbosity:    frozenset = field(default_factory=frozenset)
-    example_signals:  frozenset = field(default_factory=frozenset)
-    theory_signals:   frozenset = field(default_factory=frozenset)
-    satisfied_tokens: frozenset = field(default_factory=frozenset)
-    tech_words:       frozenset = field(default_factory=frozenset)
-    normalise_fn:     Optional[Callable[[str], str]] = None
+_PROFILE_PATH = Path(".mind_stone.json")
+_EMA_ALPHA    = 0.12   # learning rate — slow and stable
+_MIN_TURNS    = 5      # no directive until this many observations
 
 
-# ── Default English signal sets ───────────────────────────────────────────────
+# ── English signal sets ───────────────────────────────────────────────────────
 
-_EN_NEG_VERBOSITY = frozenset({
-    "shorter", "too long", "brief", "summarise", "summarize", "tldr", "tl;dr",
-    "cut it", "just tell me", "keep it short", "skip the details",
-    "dont need all that", "less words", "concise",
+# NOTE: All signals are compared against lowercased, optionally normalised text.
+# Provide pre-lowercased strings. See signals_turkish.py for non-ASCII example.
+
+# User wants a shorter response → verbosity--
+_NEG_VERBOSITY = frozenset({
+    "too long", "keep it short", "shorter", "shorten", "cut it",
+    "too verbose", "skip that", "way too long", "summarise",
+    "summarize", "be brief", "just tell me", "enough", "stop",
+    "don't need that", "too much",
 })
 
-_EN_POS_VERBOSITY = frozenset({
-    "more detail", "elaborate", "expand", "go deeper", "tell me more",
-    "explain further", "what else", "keep going", "continue", "and then",
-    "give me more", "in depth", "comprehensive", "thorough",
+# User wants more detail → verbosity++
+_POS_VERBOSITY = frozenset({
+    "more detail", "go deeper", "elaborate", "expand on that",
+    "explain more", "tell me more", "keep going", "continue",
+    "go on", "more context", "full explanation", "in depth",
+    "in detail", "detailed", "how exactly", "what do you mean",
+    "say more",
 })
 
-_EN_EXAMPLE_SIGNALS = frozenset({
-    "example", "show me", "code", "demo", "in practice", "how does it look",
-    "what does it look like", "can you show", "sample", "snippet",
-    "practical", "real world", "use case",
+# User requests a concrete example → example_bias++
+_EXAMPLE_SIGNALS = frozenset({
+    "example", "show me", "how would that look", "how do you do it",
+    "give me an example", "for instance", "code example", "demo",
+    "in practice", "concrete", "illustrate", "sample",
 })
 
-_EN_THEORY_SIGNALS = frozenset({
-    "why", "how does it work", "what is the reason", "explain",
-    "behind the scenes", "under the hood", "the concept", "principle",
-    "what makes it", "theory", "fundamentals", "philosophy",
+# User wants theoretical explanation → example_bias--
+_THEORY_SIGNALS = frozenset({
+    "why", "how does it work", "what's the logic", "what's behind it",
+    "why is that", "what is it for", "the principle", "the concept",
+    "the idea", "the reason", "what's the purpose", "fundamentally",
 })
 
-_EN_SATISFIED_TOKENS = frozenset({
-    "ok", "got it", "thanks", "thank you", "perfect", "great",
-    "makes sense", "understood", "clear", "nice", "cool", "awesome",
-    "exactly", "yep", "yes", "yup",
+# Short positive reply → follow_up_rate signal
+_SATISFIED_TOKENS = frozenset({
+    "ok", "got it", "understood", "thanks", "perfect", "great",
+    "makes sense", "clear", "good", "nice", "cool", "alright",
+    "yep", "yes", "sure", "cheers", "thank you", "awesome", "noted",
 })
 
-_EN_TECH_WORDS = frozenset({
-    # Languages
-    "python", "javascript", "typescript", "rust", "golang", "java", "cpp",
-    "sql", "bash", "shell", "swift", "kotlin", "scala",
-    # Concepts
+# Technical vocabulary — used to detect tech-heavy messages
+_TECH_WORDS = frozenset({
+    # Programming languages
+    "python", "javascript", "typescript", "rust", "golang", "java",
+    "kotlin", "swift", "cpp", "csharp", "ruby", "php", "scala",
+    "sql", "bash", "powershell",
+    # Core concepts
     "api", "rest", "graphql", "websocket", "async", "await", "thread",
     "queue", "class", "function", "method", "object", "array", "dict",
-    "json", "xml", "yaml", "regex", "token", "stream", "buffer", "mutex",
-    # AI / ML
+    "json", "xml", "yaml", "regex", "token", "stream", "buffer",
+    # Hardware / ML
     "gpu", "cuda", "cpu", "ram", "embedding", "vector", "model",
-    "inference", "finetune", "fine-tune", "rag", "prompt", "llm",
-    "neural", "transformer", "gradient", "layer", "attention",
+    "inference", "rag", "prompt", "llm", "transformer", "gradient",
+    "neural", "backprop", "layer",
     # Infrastructure
-    "docker", "kubernetes", "k8s", "git", "linux", "nginx", "redis",
-    "postgres", "mongodb", "kafka", "celery", "ci", "cd", "pipeline",
-    # General engineering
-    "algorithm", "complexity", "latency", "throughput", "cache", "index",
-    "schema", "migration", "refactor", "debug", "benchmark",
-    "concurrent", "distributed", "microservice", "monolith",
-})
-
-EN_CONFIG = SignalConfig(
-    neg_verbosity    = _EN_NEG_VERBOSITY,
-    pos_verbosity    = _EN_POS_VERBOSITY,
-    example_signals  = _EN_EXAMPLE_SIGNALS,
-    theory_signals   = _EN_THEORY_SIGNALS,
-    satisfied_tokens = _EN_SATISFIED_TOKENS,
-    tech_words       = _EN_TECH_WORDS,
-    normalise_fn     = None,
-)
-
-# Question words used by follow_up_rate to detect implicit follow-ups
-_QUESTION_WORDS = frozenset({
-    "what", "why", "how", "when", "where", "which", "who", "whose", "whom",
+    "docker", "kubernetes", "git", "linux", "nginx", "redis",
+    "aws", "gcp", "azure", "postgres", "mongodb",
+    # Tools
+    "vscode", "pycharm", "vim", "neovim",
 })
 
 
-# ── Profile data structure ─────────────────────────────────────────────────────
+# ── Profile dataclass ─────────────────────────────────────────────────────────
 
 @dataclass
 class IntelligenceProfile:
-    """Quantified model of a user's communication preferences.
+    """Quantified model of a user's communication style."""
 
-    All float attributes use Exponential Moving Average (EMA) updates.
-    Values are bounded to [0.0, 1.0].
+    verbosity:          float      = 0.50   # 0=terse, 1=detailed (global)
+    verbosity_tech:     float      = 0.50   # verbosity for technical topics (v1.3)
+    verbosity_general:  float      = 0.50   # verbosity for general topics (v1.3)
+    tech_depth:         float      = 0.50   # 0=plain language, 1=expert vocabulary
+    example_bias:       float      = 0.50   # 0=theory-first, 1=example-first
+    follow_up_rate:     float      = 0.50   # 0=always satisfied, 1=always follows up
 
-    v1.1 adds session tracking fields (backward-compatible: default to 0).
-    """
+    peak_hours:         list       = field(default_factory=list)
+    hour_counts:        dict       = field(default_factory=dict)
 
-    # Core style dimensions
-    verbosity:      float = 0.50   # 0 = terse,   1 = verbose
-    tech_depth:     float = 0.50   # 0 = plain,   1 = expert
-    example_bias:   float = 0.50   # 0 = theory,  1 = examples
-    follow_up_rate: float = 0.50   # 0 = satisfied easily, 1 = always wants more
-
-    # Temporal patterns
-    peak_hours:  list  = field(default_factory=list)   # top-3 active hours
-    hour_counts: dict  = field(default_factory=dict)   # {hour: message_count}
-
-    # Session tracking (v1.1)
-    session_count:         int   = 0    # number of distinct sessions observed
-    current_session_turns: int   = 0    # turns in the current session
-    last_observe_ts:       float = 0.0  # epoch time of the last observe() call
-
-    # Metadata
-    total_turns: int   = 0
-    created_at:  float = field(default_factory=time.time)
-    updated_at:  float = field(default_factory=time.time)
+    total_turns:        int        = 0
+    created_at:         float      = field(default_factory=time.time)
+    updated_at:         float      = field(default_factory=time.time)
 
     def confidence(self) -> float:
-        """Profile reliability, 0->1.
-
-        Reaches ~50% at 10 turns, ~100% at 55 turns.
-        Style directives only activate above a confidence threshold.
-        """
-        return min(1.0, max(0.0, (self.total_turns - 5) / 50))
-
-    def as_dict(self) -> dict:
-        return asdict(self)
+        """Profile reliability, 0 to 1. Grows with observations."""
+        # Full confidence at 50 turns; ~20% at 5 turns; 0 before that
+        return min(1.0, max(0.0, (self.total_turns - _MIN_TURNS) / 45))
 
 
-# ── Core engine ────────────────────────────────────────────────────────────────
+# ── Core class ────────────────────────────────────────────────────────────────
 
 class MindStone:
-    """Self-calibrating communication style engine.
+    """Silently calibrates the assistant's communication style.
 
-    Thread-safe: a single MindStone instance can be shared across threads
-    (e.g. in an async web framework) without data races. (v1.2)
+    Extracts signals from every conversation turn, updates the profile
+    via EMA, and generates a compact directive once enough data exists.
 
     Parameters
     ----------
-    path : Path | str
-        Where to persist the profile (JSON). Default: ``.mind_stone.json``.
-    config : SignalConfig
-        Language-specific signal sets. Default: English (EN_CONFIG).
-    ema_alpha : float
-        Learning rate for EMA updates. Lower = more stable, slower.
-        Default: 0.12 (~40 turns to fully calibrate).
-    min_confidence : float
-        Confidence threshold before directives activate. Default: 0.15 (~12 turns).
-    save_every : int
-        Persist to disk every N turns. Default: 5.
-    session_gap_minutes : int  [v1.1]
-        Minutes of inactivity that mark the start of a new session.
-        Default: 30. Set to 0 to disable session tracking.
-    tech_amplifier : float  [v1.2]
-        Multiplier applied to tech-word ratio when updating tech_depth.
-        Higher values make the profile more sensitive to technical vocabulary.
-        Default: 8.0.
+    path : str | Path
+        Profile persistence file. Default ".mind_stone.json".
+    user_name : str
+        Display name used inside directives. Default "User".
+    normalise_fn : callable, optional
+        Text normalisation applied before signal matching.
+        Use for non-ASCII languages (see signals_turkish.py).
     """
-
-    # How many turns at session start use dampened alpha (v1.1)
-    _SESSION_RAMP_TURNS = 3
 
     def __init__(
         self,
-        path:                str | Path   = ".mind_stone.json",
-        config:              SignalConfig  = EN_CONFIG,
-        ema_alpha:           float        = 0.12,
-        min_confidence:      float        = 0.15,
-        save_every:          int          = 5,
-        session_gap_minutes: int          = 30,
-        tech_amplifier:      float        = 8.0,
+        path: Path = _PROFILE_PATH,
+        user_name: str = "User",
+        normalise_fn: Optional[Callable[[str], str]] = None,
     ) -> None:
-        self._path              = Path(path)
-        self._config            = config
-        self._alpha             = ema_alpha
-        self._min_conf          = min_confidence
-        self._save_every        = save_every
-        self._session_gap_sec   = session_gap_minutes * 60
-        self._tech_amplifier    = tech_amplifier
-        self._lock              = threading.Lock()   # v1.2: thread safety
-        self.profile            = self._load()
+        self._path         = Path(path)
+        self._user_name    = user_name
+        self._normalise_fn = normalise_fn
+        self._lock         = threading.Lock()
+        self.profile       = self._load()
 
     # ── Persistence ────────────────────────────────────────────────────────────
 
     def _load(self) -> IntelligenceProfile:
-        """Load profile from disk. Returns a fresh profile on any error."""
         if not self._path.exists():
             return IntelligenceProfile()
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
+            base_verbosity = float(data.get("verbosity", 0.50))
             p = IntelligenceProfile(
-                verbosity              = float(data.get("verbosity",              0.50)),
-                tech_depth             = float(data.get("tech_depth",             0.50)),
-                example_bias           = float(data.get("example_bias",           0.50)),
-                follow_up_rate         = float(data.get("follow_up_rate",         0.50)),
-                peak_hours             = list(data.get("peak_hours",              [])),
-                hour_counts            = {int(k): int(v)
-                                          for k, v in data.get("hour_counts", {}).items()},
-                # v1.1 fields — default to 0 for v1.0 profiles (backward-compatible)
-                session_count          = int(data.get("session_count",            0)),
-                current_session_turns  = int(data.get("current_session_turns",    0)),
-                last_observe_ts        = float(data.get("last_observe_ts",        0.0)),
-                total_turns            = int(data.get("total_turns",              0)),
-                created_at             = float(data.get("created_at",             time.time())),
-                updated_at             = float(data.get("updated_at",             time.time())),
+                verbosity         = base_verbosity,
+                # v1.3 fields — fall back to global verbosity if loading older profile
+                verbosity_tech    = float(data.get("verbosity_tech",    base_verbosity)),
+                verbosity_general = float(data.get("verbosity_general", base_verbosity)),
+                tech_depth        = float(data.get("tech_depth",     0.50)),
+                example_bias      = float(data.get("example_bias",   0.50)),
+                follow_up_rate    = float(data.get("follow_up_rate", 0.50)),
+                peak_hours        = list(data.get("peak_hours",      [])),
+                hour_counts       = {int(k): int(v) for k, v in data.get("hour_counts", {}).items()},
+                total_turns       = int(data.get("total_turns",      0)),
+                created_at        = float(data.get("created_at",     time.time())),
+                updated_at        = float(data.get("updated_at",     time.time())),
             )
             return p
-        except Exception:
-            # Corrupt or unreadable file: start fresh rather than crash
+        except Exception as e:
+            print(f"[MindStone] Could not load profile, starting fresh: {e}", flush=True)
             return IntelligenceProfile()
 
     def _save(self) -> None:
-        """Write profile to disk. Called internally; lock must already be held."""
         try:
             self.profile.updated_at = time.time()
+            data = asdict(self.profile)
             self._path.write_text(
-                json.dumps(self.profile.as_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-        except Exception as exc:
-            print(f"[MindStone] Save error: {exc}")
+        except Exception as e:
+            print(f"[MindStone] Save error: {e}", flush=True)
 
-    # ── Core API ───────────────────────────────────────────────────────────────
+    # ── Observation ────────────────────────────────────────────────────────────
 
-    def observe(
-        self,
-        user_message:      str,
-        assistant_message: str,
-        verbose:           bool = False,
-    ) -> Optional[dict]:
-        """Update the profile from one conversation turn.
-
-        Call this after every user -> assistant exchange.
-        Thread-safe: safe to call concurrently from multiple threads. (v1.2)
-
-        Parameters
-        ----------
-        user_message       The user's raw message text.
-        assistant_message  The assistant's full response text.
-        verbose            If True, return a signal report dict instead of None.
-                           Useful for debugging and integration testing.
-
-        Returns
-        -------
-        None by default. A dict when verbose=True:
-            {
-              "session":  {"is_new": bool, "number": int, "turn": int, "alpha_used": float},
-              "signals":  {"verbosity": {...}, "tech_depth": {...}, ...},
-              "profile":  summary dict,
-            }
-        """
+    def observe(self, user_msg: str, assistant_msg: str) -> None:
+        """Process one conversation turn and update the profile. Thread-safe."""
         with self._lock:
-            return self._observe_locked(user_message, assistant_message, verbose)
+            self._observe_locked(user_msg, assistant_msg)
 
-    def _observe_locked(
-        self,
-        user_message:      str,
-        assistant_message: str,
-        verbose:           bool,
-    ) -> Optional[dict]:
-        """Inner observe logic. Must be called with self._lock held."""
-        p   = self.profile
-        cfg = self._config
-        now = time.time()
-
-        # ── Session boundary detection (v1.1) ─────────────────────────────────
-        is_new_session = False
-        if self._session_gap_sec > 0 and p.last_observe_ts > 0:
-            gap_sec = now - p.last_observe_ts
-            if gap_sec >= self._session_gap_sec:
-                is_new_session = True
-                p.session_count += 1
-                p.current_session_turns = 0
-        elif p.last_observe_ts == 0:
-            # Very first ever observe() call
-            p.session_count = 1
-
-        p.last_observe_ts = now
-        p.current_session_turns += 1
+    def _observe_locked(self, user_msg: str, assistant_msg: str) -> None:
+        p = self.profile
         p.total_turns += 1
 
-        # Session-dampened alpha: first _SESSION_RAMP_TURNS of a new session
-        # use half the normal alpha so one atypical session can't override
-        # a long-term profile built over many sessions.
-        if is_new_session and p.current_session_turns <= self._SESSION_RAMP_TURNS:
-            effective_alpha = self._alpha * 0.5
-        else:
-            effective_alpha = self._alpha
-
-        # Normalise and lowercase for signal matching
-        um = (user_message or "").strip().lower()
-        if callable(cfg.normalise_fn):
+        um = (user_msg or "").strip().lower()
+        if self._normalise_fn is not None:
             try:
-                um = cfg.normalise_fn(um)
+                um = self._normalise_fn(um)
             except Exception:
-                pass   # normalise failure: continue with unnormalised text
+                pass
 
-        um_words = set(re.findall(r"\w+", um))
-
-        # ── Hour tracking ──────────────────────────────────────────────────────
+        # ── Time tracking ─────────────────────────────────────────────────────
         hour = datetime.now().hour
         p.hour_counts[hour] = p.hour_counts.get(hour, 0) + 1
         p.peak_hours = _top_hours(p.hour_counts, n=3)
 
-        # ── Verbosity ─────────────────────────────────────────────────────────
-        verbosity_signal: str
-        verbosity_before = p.verbosity
+        # ── Topic detection: technical vs general? (v1.3) ─────────────────────
+        um_words = set(re.findall(r"\w+", um))
+        tech_ratio = len(um_words & _TECH_WORDS) / max(len(um_words), 1)
+        is_technical = tech_ratio >= 0.05   # ~1 tech word per 20 words
 
-        if _matches(um, um_words, cfg.neg_verbosity):
-            p.verbosity      = _ema(p.verbosity, 0.0, alpha=0.28)
-            verbosity_signal = "neg_explicit"
-        elif _matches(um, um_words, cfg.pos_verbosity):
-            p.verbosity      = _ema(p.verbosity, 1.0, alpha=0.22)
-            verbosity_signal = "pos_explicit"
+        # ── Verbosity signals ─────────────────────────────────────────────────
+        _neg_hit = (um_words & _NEG_VERBOSITY) or any(
+            s in um for s in _NEG_VERBOSITY if " " in s
+        )
+        _pos_hit = (um_words & _POS_VERBOSITY) or any(
+            s in um for s in _POS_VERBOSITY if " " in s
+        )
+
+        if _neg_hit:
+            # Explicit override: direct set, no EMA (v1.3)
+            p.verbosity = 0.10
+            if is_technical:
+                p.verbosity_tech    = 0.10
+            else:
+                p.verbosity_general = 0.10
+        elif _pos_hit:
+            # Explicit override: direct set, no EMA (v1.3)
+            p.verbosity = 0.90
+            if is_technical:
+                p.verbosity_tech    = 0.90
+            else:
+                p.verbosity_general = 0.90
         else:
-            wc             = len(um.split())
-            length_signal  = min(1.0, wc / 15)
-            p.verbosity    = _ema(p.verbosity, length_signal, alpha=effective_alpha * 0.4)
-            verbosity_signal = f"length({wc}w)"
+            # Passive: slow EMA update based on message length
+            user_word_count = len(um.split())
+            length_signal = min(1.0, user_word_count / 15)
+            p.verbosity = _ema(p.verbosity, length_signal, alpha=_EMA_ALPHA * 0.5)
+            if is_technical:
+                p.verbosity_tech    = _ema(p.verbosity_tech,    length_signal, alpha=_EMA_ALPHA * 0.5)
+            else:
+                p.verbosity_general = _ema(p.verbosity_general, length_signal, alpha=_EMA_ALPHA * 0.5)
 
-        p.verbosity = _clamp(p.verbosity)
+        p.verbosity         = _clamp(p.verbosity)
+        p.verbosity_tech    = _clamp(p.verbosity_tech)
+        p.verbosity_general = _clamp(p.verbosity_general)
 
         # ── Technical depth ───────────────────────────────────────────────────
-        tech_ratio  = 0.0
-        tech_before = p.tech_depth
-        if um_words:
-            tech_ratio  = len(um_words & cfg.tech_words) / max(len(um_words), 1)
-            tech_signal = min(1.0, tech_ratio * self._tech_amplifier)   # v1.2: configurable
-            p.tech_depth = _ema(p.tech_depth, tech_signal, alpha=effective_alpha)
+        all_words = set(re.findall(r"\w+", um))
+        if all_words:
+            tr = len(all_words & _TECH_WORDS) / max(len(all_words), 1)
+            tech_signal = min(1.0, tr * 8)   # 0.125 ratio → full signal
+            p.tech_depth = _ema(p.tech_depth, tech_signal, alpha=_EMA_ALPHA)
             p.tech_depth = _clamp(p.tech_depth)
 
-        # ── Example vs theory ─────────────────────────────────────────────────
-        example_signal: Optional[str] = None
-        example_before = p.example_bias
-        if _matches(um, um_words, cfg.example_signals):
-            p.example_bias = _ema(p.example_bias, 1.0, alpha=0.20)
-            example_signal = "example"
-        elif _matches(um, um_words, cfg.theory_signals):
-            p.example_bias = _ema(p.example_bias, 0.0, alpha=0.16)
-            example_signal = "theory"
+        # ── Example vs theory preference ──────────────────────────────────────
+        if any(sig in um for sig in _EXAMPLE_SIGNALS):
+            p.example_bias = _ema(p.example_bias, 1.0, alpha=0.18)
+        elif any(sig in um for sig in _THEORY_SIGNALS):
+            p.example_bias = _ema(p.example_bias, 0.0, alpha=0.15)
         p.example_bias = _clamp(p.example_bias)
 
-        # ── Satisfaction / follow-up rate ─────────────────────────────────────
-        # v1.2: threshold raised 4→6 words; question detection added so
-        # "got it, but why?" is not counted as satisfied.
-        sat_before  = p.follow_up_rate
-        wc          = len(um.split())
-        has_satisfied_token = bool(um_words & cfg.satisfied_tokens)
-        is_question = um.endswith("?") or bool(um_words & _QUESTION_WORDS)
-        is_satisfied = wc <= 6 and has_satisfied_token and not is_question
-        p.follow_up_rate = _ema(
-            p.follow_up_rate,
-            0.0 if is_satisfied else 1.0,
-            alpha=effective_alpha,
+        # ── Satisfaction rate ─────────────────────────────────────────────────
+        um_token_count = len(um.split())
+        is_satisfied = (
+            um_token_count <= 4
+            and bool(set(re.findall(r"\w+", um)) & _SATISFIED_TOKENS)
         )
+        satisfaction_signal = 1.0 if is_satisfied else 0.0
+        p.follow_up_rate = _ema(p.follow_up_rate, satisfaction_signal, alpha=_EMA_ALPHA)
         p.follow_up_rate = _clamp(p.follow_up_rate)
 
-        # ── Periodic save ──────────────────────────────────────────────────────
-        if p.total_turns % self._save_every == 0:
+        # ── Persist every 5 turns (reduce I/O) ───────────────────────────────
+        if p.total_turns % 5 == 0:
             self._save()
 
-        # ── Verbose report ────────────────────────────────────────────────────
-        if verbose:
-            return {
-                "session": {
-                    "is_new":     is_new_session,
-                    "number":     p.session_count,
-                    "turn":       p.current_session_turns,
-                    "alpha_used": round(effective_alpha, 4),
-                },
-                "signals": {
-                    "verbosity": {
-                        "signal": verbosity_signal,
-                        "before": round(verbosity_before, 4),
-                        "after":  round(p.verbosity, 4),
-                        "delta":  round(p.verbosity - verbosity_before, 4),
-                    },
-                    "tech_depth": {
-                        "tech_word_ratio": round(tech_ratio, 4),
-                        "before":          round(tech_before, 4),
-                        "after":           round(p.tech_depth, 4),
-                        "delta":           round(p.tech_depth - tech_before, 4),
-                    },
-                    "example_bias": {
-                        "signal": example_signal,
-                        "before": round(example_before, 4),
-                        "after":  round(p.example_bias, 4),
-                        "delta":  round(p.example_bias - example_before, 4),
-                    },
-                    "follow_up_rate": {
-                        "satisfied":   is_satisfied,
-                        "is_question": is_question,
-                        "before":      round(sat_before, 4),
-                        "after":       round(p.follow_up_rate, 4),
-                        "delta":       round(p.follow_up_rate - sat_before, 4),
-                    },
-                },
-                "profile": self._summary_locked(),
-            }
-        return None
+    # ── Directive generation ──────────────────────────────────────────────────
 
     def get_style_directive(self) -> str:
-        """Return a short system-prompt fragment based on the learned profile.
+        """Return a short style directive based on the current profile. Thread-safe.
 
-        Returns "" until enough data has been observed. When non-empty,
-        append this to your system prompt before each LLM call.
-        Thread-safe. (v1.2)
-
-        v1.1: includes a temporal note when the user is active outside
-        their established peak hours (requires confidence >= 50%).
+        Returns an empty string until enough data exists (~12 turns).
+        Intended for silent injection into the system prompt.
         """
         with self._lock:
-            p = self.profile
-            if p.confidence() < self._min_conf:
-                return ""
+            return self._style_directive_locked()
 
-            conf  = p.confidence()
-            lines: list[str] = []
+    def _style_directive_locked(self) -> str:
+        p = self.profile
+        if p.confidence() < 0.15:   # ~12 turns minimum
+            return ""
 
-            # Verbosity
+        lines: list = []
+        conf = p.confidence()
+        _n = self._user_name
+
+        # ── Verbosity — topic-conditional when gap is meaningful (v1.3) ───────
+        tech_gen_gap = abs(p.verbosity_tech - p.verbosity_general)
+        if tech_gen_gap > 0.25 and conf > 0.20:
+            if p.verbosity_tech < 0.35 and p.verbosity_general > 0.55:
+                lines.append(
+                    f"{_n} wants concise answers on technical topics; "
+                    "prefers more explanation in general conversation."
+                )
+            elif p.verbosity_tech > 0.65 and p.verbosity_general < 0.45:
+                lines.append(
+                    f"{_n} wants detailed explanations on technical topics; "
+                    "keep general conversation shorter."
+                )
+            else:
+                if p.verbosity < 0.30:
+                    lines.append(
+                        f"{_n} prefers concise answers — get to the point, skip the preamble."
+                    )
+                elif p.verbosity > 0.70:
+                    lines.append(
+                        f"{_n} appreciates detailed explanations — "
+                        "don't hold back when depth is warranted."
+                    )
+        else:
             if p.verbosity < 0.30:
                 lines.append(
-                    "This user prefers concise, to-the-point answers -- "
-                    "skip preamble and keep responses tight."
+                    f"{_n} prefers concise answers — get to the point, skip the preamble."
                 )
             elif p.verbosity > 0.70:
                 lines.append(
-                    "This user appreciates detailed explanations -- "
-                    "feel free to elaborate when it adds value."
+                    f"{_n} appreciates detailed explanations — "
+                    "don't hold back when depth is warranted."
                 )
 
-            # Technical depth
-            if conf > 0.30:
-                if p.tech_depth > 0.72:
-                    lines.append(
-                        "The user is technically proficient -- "
-                        "use domain terminology without over-explaining basics."
-                    )
-                elif p.tech_depth < 0.28:
-                    lines.append(
-                        "Prefer plain language over jargon; "
-                        "explain technical terms when they are unavoidable."
-                    )
+        # Tech depth
+        if p.tech_depth > 0.72 and conf > 0.30:
+            lines.append(
+                f"You can use technical terms without explaining them — "
+                f"{_n} is proficient in these areas."
+            )
+        elif p.tech_depth < 0.28 and conf > 0.30:
+            lines.append(
+                "Use plain language instead of technical jargon; "
+                "support with simple examples when needed."
+            )
 
-            # Example vs theory
-            if conf > 0.25:
-                if p.example_bias > 0.68:
-                    lines.append(
-                        "Where possible, lead with a concrete example or code snippet."
-                    )
-                elif p.example_bias < 0.32:
-                    lines.append(
-                        "Lead with the concept or reasoning; add examples only if needed."
-                    )
+        # Example bias
+        if p.example_bias > 0.68 and conf > 0.25:
+            lines.append(
+                "Illustrate with a concrete example or code snippet whenever possible."
+            )
+        elif p.example_bias < 0.32 and conf > 0.25:
+            lines.append(
+                "Explain the reasoning first; only provide an example if necessary."
+            )
 
-            # Low satisfaction -> anticipate the follow-up
-            if conf > 0.40 and p.follow_up_rate < 0.30:
-                lines.append(
-                    "This user often asks follow-up questions -- "
-                    "aim for completeness and briefly anticipate the obvious next question."
-                )
+        # Low satisfaction → user often needs more
+        if p.follow_up_rate < 0.30 and conf > 0.40:
+            lines.append(
+                f"{_n} often asks follow-up questions — keep your answer a bit more complete "
+                "and briefly touch on the likely next question."
+            )
 
-            # Temporal note (v1.1): active outside established peak hours?
-            if conf >= 0.50 and p.peak_hours:
-                current_hour = datetime.now().hour
-                if current_hour not in p.peak_hours:
-                    lines.append(
-                        "The user is active outside their typical hours -- "
-                        "keep responses direct and avoid unnecessary elaboration."
-                    )
+        if not lines:
+            return ""
 
-            if not lines:
-                return ""
+        header = (
+            f"[COMMUNICATION PROFILE for {_n.upper()}"
+            " — internal directive, do not repeat this]\n"
+        )
+        return header + "\n".join(f"- {l}" for l in lines)
 
-            header = "[Adaptive style -- internal directive, do not repeat this to the user]\n"
-            return header + "\n".join(f"* {l}" for l in lines)
+    # ── Status ────────────────────────────────────────────────────────────────
 
     def summary(self) -> dict:
-        """Human-readable profile summary. Thread-safe. (v1.2)"""
-        with self._lock:
-            return self._summary_locked()
-
-    def _summary_locked(self) -> dict:
-        """Inner summary logic. Must be called with self._lock held."""
+        """Human-readable profile snapshot."""
         p = self.profile
         return {
-            "version":           __version__,
-            "observations":      p.total_turns,
-            "confidence":        f"{p.confidence() * 100:.0f}%",
-            "sessions":          p.session_count,
-            "verbosity":         _label(p.verbosity,      "terse",   "balanced", "verbose"),
-            "tech_depth":        _label(p.tech_depth,     "plain",   "mixed",    "expert"),
-            "learning_style":    _label(p.example_bias,   "theory",  "balanced", "examples"),
-            "satisfaction_rate": f"{p.follow_up_rate * 100:.0f}%",
-            "peak_hours":        p.peak_hours,
+            "total_observations": p.total_turns,
+            "confidence":         f"{p.confidence()*100:.0f}%",
+            "verbosity":          _label(p.verbosity,         "terse",   "balanced", "detailed"),
+            "verbosity_tech":     _label(p.verbosity_tech,    "terse",   "balanced", "detailed"),
+            "verbosity_general":  _label(p.verbosity_general, "terse",   "balanced", "detailed"),
+            "tech_depth":         _label(p.tech_depth,        "plain",   "mixed",    "expert"),
+            "example_bias":       _label(p.example_bias,      "theory-first", "balanced", "example-first"),
+            "follow_up_rate":     f"{p.follow_up_rate*100:.0f}%",
+            "peak_hours":         p.peak_hours,
         }
 
-    def session_summary(self) -> dict:
-        """Statistics for the current session only. Thread-safe. (v1.1/v1.2)"""
-        with self._lock:
-            p   = self.profile
-            now = time.time()
-            if p.last_observe_ts > 0 and p.current_session_turns > 0:
-                session_age_min = round((now - p.last_observe_ts) / 60, 1)
-            else:
-                session_age_min = 0.0
-
-            return {
-                "session_number":          p.session_count,
-                "current_session_turns":   p.current_session_turns,
-                "minutes_since_last_turn": session_age_min,
-                "total_sessions":          p.session_count,
-                "total_turns_all_time":    p.total_turns,
-            }
+    # ── Reset ─────────────────────────────────────────────────────────────────
 
     def reset(self) -> None:
-        """Clear the profile and delete the saved file. Thread-safe. (v1.2)"""
+        """Reset the profile and clear the persistence file."""
         with self._lock:
             self.profile = IntelligenceProfile()
-            if self._path.exists():
-                self._path.unlink()
+            self._save()
 
 
-# ── Internal helpers ───────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _ema(current: float, new_val: float, alpha: float) -> float:
-    """Exponential moving average -- recent observations weighted more."""
+def _ema(current: float, new_val: float, alpha: float = _EMA_ALPHA) -> float:
+    """Exponential moving average — recent observations weighted higher."""
     return current * (1 - alpha) + new_val * alpha
 
 
@@ -633,6 +449,7 @@ def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
 
 
 def _top_hours(counts: dict, n: int = 3) -> list:
+    """Return the n hours with the most activity."""
     if not counts:
         return []
     return [h for h, _ in sorted(counts.items(), key=lambda x: -x[1])[:n]]
@@ -646,13 +463,14 @@ def _label(value: float, low: str, mid: str, high: str) -> str:
     return mid
 
 
-def _matches(text: str, tokens: set, signals: frozenset) -> bool:
-    """Check if any signal in the set appears in the text or token set."""
-    for sig in signals:
-        if " " in sig:
-            if sig in text:
-                return True
-        else:
-            if sig in tokens:
-                return True
-    return False
+# ── Singleton ─────────────────────────────────────────────────────────────────
+
+_instance: Optional[MindStone] = None
+
+
+def get_mind_stone(path: str = ".mind_stone.json", user_name: str = "User") -> MindStone:
+    """Return the global MindStone instance (lazy init)."""
+    global _instance
+    if _instance is None:
+        _instance = MindStone(path=path, user_name=user_name)
+    return _instance

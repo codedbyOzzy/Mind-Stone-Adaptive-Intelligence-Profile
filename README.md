@@ -13,12 +13,12 @@ Together, they build something more complete.
 
 | Stone | Status | What it learns |
 |-------|--------|----------------|
-| [**Mind Stone**](#-mind-stone) | `v1.2.0` ✅ | *How* the user communicates — style, depth, pace |
-| [**Echo Stone**](#-echo-stone) | `v1.0.0` ✅ | *Whether* the user actually understood |
-| [**Bond Stone**](#bond-stone) | `active` ⚡ | *Who* the user is — their world, context, history |
-| [**Intuition Stone**](#intuition-stone) | `active` ⚡ | *Where* the conversation is going |
+| [**Mind Stone**](#-mind-stone) | `v1.3.0` ✅ | *How* the user communicates — style, depth, pace |
+| [**Echo Stone**](#-echo-stone) | `v1.1.0` ✅ | *Whether* the user actually understood |
+| [**Bond Stone**](#bond-stone) | `v1.1.0` ✅ | *Who* the user is — their world, context, history |
+| [**Intuition Stone**](#intuition-stone) | `v1.1.0` ✅ | *Where* the conversation is going |
 
-> **Bond Stone** and **Intuition Stone** are in active production use inside [FRIDAY Synapse](https://github.com/codedbyOzzy/ProjectFRIDAY). Standalone public releases are in progress.
+All four stones are production-tested inside [FRIDAY Synapse](https://github.com/codedbyOzzy/ProjectFRIDAY) and available as standalone modules.
 
 ---
 
@@ -230,37 +230,38 @@ if directive:
 
 ### API
 
-#### `MindStone(path, config, ema_alpha, min_confidence, save_every, session_gap_minutes, tech_amplifier)`
+#### `MindStone(path, user_name, normalise_fn)`
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `path` | `.mind_stone.json` | Profile persistence path |
-| `config` | `EN_CONFIG` | Language signal sets |
-| `ema_alpha` | `0.12` | Learning rate |
-| `min_confidence` | `0.15` | Threshold before directives activate (~12 turns) |
-| `save_every` | `5` | Persist to disk every N turns |
-| `session_gap_minutes` | `30` | Gap that marks a new session boundary |
-| `tech_amplifier` | `8.0` | Sensitivity to technical vocabulary |
+| `user_name` | `"User"` | Display name used in directives |
+| `normalise_fn` | `None` | Text normalisation for non-ASCII languages |
 
 #### Methods
 
 ```python
-stone.observe(user_message, assistant_message, verbose=False)
+stone.observe(user_message, assistant_message)
 stone.get_style_directive() -> str
 stone.summary()             -> dict
-stone.session_summary()     -> dict
 stone.reset()
 ```
 
-#### `observe(verbose=True)` report
+#### Profile dimensions (v1.3)
 
-```python
-{
-  "session":  {"is_new": bool, "number": int, "turn": int, "alpha_used": float},
-  "signals":  {"verbosity": {...}, "tech_depth": {...}, ...},
-  "profile":  { ... }
-}
-```
+| Dimension | What changed in v1.3 |
+|-----------|---------------------|
+| `verbosity` | Global verbosity (unchanged) |
+| `verbosity_tech` | **New** — verbosity tracked separately for technical topics |
+| `verbosity_general` | **New** — verbosity tracked separately for general topics |
+| `tech_depth` | Unchanged |
+| `example_bias` | Unchanged |
+| `follow_up_rate` | Unchanged |
+
+When `verbosity_tech` and `verbosity_general` diverge by more than 0.25, the directive
+emits a topic-specific instruction instead of a global one. Explicit override signals
+("keep it short", "more detail") now **directly set** the value instead of nudging via
+EMA — immediate effect guaranteed.
 
 ---
 
@@ -415,7 +416,60 @@ Bond Stone solves this by building a persistent, structured model of the user's 
 
 The difference between Bond Stone and simply saving chat history is the difference between a notebook and a map. Chat history stores what was said. Bond Stone builds what it means — who the people are, what the projects involve, how the pieces connect. When you say "same thing as before", it actually knows what that means.
 
-**Status:** Active in [FRIDAY Synapse](https://github.com/codedbyOzzy/ProjectFRIDAY). Standalone public release in progress.
+### Quick start
+
+```python
+from bond_stone import BondStone
+
+stone = BondStone()
+
+# After every conversation turn:
+stone.observe(user_message, assistant_message)
+
+# Before every LLM call:
+ctx = stone.get_context_directive()
+if ctx:
+    system_prompt += "\n\n" + ctx
+
+# Explicit fact (passive extraction works automatically):
+stone.remember("I work on the Vision project using Python and CUDA")
+
+# Register a shorthand alias:
+stone.alias("usual setup", "Python + CUDA + Ollama on Windows 11")
+```
+
+### What gets captured automatically
+
+| Signal type | Trigger | Example |
+|-------------|---------|---------|
+| Tech stack  | Technical term found in message | `python`, `docker`, `cuda` |
+| Explicit fact | Remember/note signal | "remember that I work on the Vision project" |
+| Constraint | Can't-use signal | "I can't use Docker in this environment" |
+| Preference | Preference signal | "I always prefer typed Python over raw dicts" |
+| Alias | `stone.alias()` call | "usual setup" → "Python + CUDA + Ollama" |
+
+### API
+
+#### `BondStone(path, config, save_every, max_facts)`
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `path` | `.bond_stone.json` | Profile persistence path |
+| `config` | `EN_CONFIG` | Language signal sets |
+| `save_every` | `5` | Persist to disk every N turns |
+| `max_facts` | `60` | Maximum stored facts (oldest/lowest-confidence pruned first) |
+
+#### Methods
+
+```python
+stone.observe(user_message, assistant_message, verbose=False)
+stone.remember(fact, fact_type="explicit")
+stone.alias(shorthand, expansion)
+stone.resolve(query)           -> Optional[str]
+stone.get_context_directive(topic_hint="")  -> str
+stone.summary()                -> dict
+stone.reset()
+```
 
 ---
 
@@ -427,7 +481,61 @@ Intuition Stone learns the shape of conversations. It tracks which questions ten
 
 This isn't about predicting the future. It's about recognising that most conversations follow familiar arcs — and that an assistant who has seen enough of them can stop waiting to be asked.
 
-**Status:** Active in [FRIDAY Synapse](https://github.com/codedbyOzzy/ProjectFRIDAY). Standalone public release in progress.
+### Quick start
+
+```python
+from intuition_stone import IntuitionStone
+
+stone = IntuitionStone()
+
+# After every conversation turn:
+stone.observe(user_message, assistant_message)
+
+# Before every LLM call:
+hint = stone.get_prediction_directive(current_user_message)
+if hint:
+    system_prompt += "\n\n" + hint
+```
+
+### How prediction works
+
+```
+Observations accumulate:
+  turn 1:  "python async error" → "event loop"
+  turn 2:  "fastapi endpoint"   → "async handler"
+  turn 3:  "asyncio task"       → "event loop"
+  turn 4:  "aiohttp request"    → "event loop"
+
+After turn 4, min_observations (3) reached:
+  cuda → memory  (seen 4×, P=0.71)
+
+Next time the user asks about "asyncio task":
+  directive → "this user usually follows up about event loop next"
+```
+
+### API
+
+#### `IntuitionStone(path, config, user_name, save_every, min_observations, min_confidence, max_predictions, expire_days)`
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `path` | `.intuition_stone.json` | Profile persistence path |
+| `config` | `EN_CONFIG` | Language signal sets |
+| `user_name` | `"User"` | Display name used in directives |
+| `save_every` | `5` | Persist every N turns |
+| `min_observations` | `3` | Minimum times a transition must be seen |
+| `min_confidence` | `0.40` | Minimum P(B\|A) to emit a prediction |
+| `max_predictions` | `2` | Max follow-up topics in one directive |
+| `expire_days` | `90` | Prune transitions not seen within this many days |
+
+#### Methods
+
+```python
+stone.observe(user_message, assistant_message, verbose=False)
+stone.get_prediction_directive(current_user_message)  -> str
+stone.summary()  -> dict
+stone.reset()
+```
 
 ---
 
@@ -471,9 +579,11 @@ Zero-dependency is a hard design constraint. Both stones run in microseconds, pr
 ## Files
 
 ```
-mind_stone.py          Mind Stone core module (v1.2.0)
-echo_stone.py          Echo Stone core module (v1.0.0)
-signals_turkish.py     Turkish signal sets for both stones
+mind_stone.py          Mind Stone core module (v1.3.0)
+echo_stone.py          Echo Stone core module (v1.1.0)
+bond_stone.py          Bond Stone core module (v1.1.0)
+intuition_stone.py     Intuition Stone core module (v1.1.0)
+signals_turkish.py     Turkish signal sets for all stones
 example.py             Usage examples
 test_v11.py            Mind Stone v1.1 test suite (16 tests)
 test_v12.py            Mind Stone v1.2 test suite (30 tests)
